@@ -1,0 +1,190 @@
+# ✅ Required Libraries
+!pip install google-auth-oauthlib==0.4.6 yfinance scikit-learn flask
+
+import os
+import re
+import pickle
+import json
+from datetime import datetime, timedelta
+import pandas as pd
+import yfinance as yf
+from sklearn.linear_model import LinearRegression
+
+from flask import Flask, request, redirect, session, url_for, jsonify
+from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+
+app = Flask(__name__)
+app.secret_key = 'your_secret_key_here'  # Replace with a secure secret key
+
+SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
+
+# 🔐 Login and OAuth flow
+@app.route('/login')
+def login():
+    flow = Flow.from_client_secrets_file(
+        'credentials.json',
+        scopes=SCOPES,
+        redirect_uri=url_for('oauth2callback', _external=True)
+    )
+    auth_url, _ = flow.authorization_url(prompt='consent')
+    session['state'] = flow.oauth2session.state
+    session['flow'] = pickle.dumps(flow)
+    return redirect(auth_url)
+
+@app.route('/oauth2callback')
+def oauth2callback():
+    flow = pickle.loads(session['flow'])
+    flow.fetch_token(authorization_response=request.url)
+    credentials = flow.credentials
+    session['credentials'] = credentials_to_dict(credentials)
+    return redirect(url_for('dashboard'))
+
+def credentials_to_dict(creds):
+    return {
+        'token': creds.token,
+        'refresh_token': creds.refresh_token,
+        'token_uri': creds.token_uri,
+        'client_id': creds.client_id,
+        'client_secret': creds.client_secret,
+        'scopes': creds.scopes
+    }
+
+# 🔁 Get credentials from session
+def get_google_credentials():
+    if 'credentials' not in session:
+        return None
+    creds_info = session['credentials']
+    creds = Credentials(
+        token=creds_info['token'],
+        refresh_token=creds_info.get('refresh_token'),
+        token_uri=creds_info['token_uri'],
+        client_id=creds_info['client_id'],
+        client_secret=creds_info['client_secret'],
+        scopes=creds_info['scopes']
+    )
+    return creds
+
+# 💰 ExpenseBot Logic
+class ExpenseBot:
+    def __init__(self, user_id):
+        self.user_id = user_id
+        self.data_file = f"{user_id}_expenses.pkl"
+        self.expenses = self.load_pickle(self.data_file, [])
+        self.model = LinearRegression()
+
+    def load_pickle(self, filepath, default):
+        if os.path.exists(filepath):
+            with open(filepath, "rb") as f:
+                return pickle.load(f)
+        return default
+
+    def save_pickle(self, filepath, data):
+        with open(filepath, "wb") as f:
+            pickle.dump(data, f)
+
+    def add_expense(self, amount, category):
+        self.expenses.append({
+            "amount": amount,
+            "category": category.lower(),
+            "timestamp": datetime.now()
+        })
+        self.save_pickle(self.data_file, self.expenses)
+
+    def train_predictor(self):
+        if len(self.expenses) < 3:
+            return
+        df = pd.DataFrame(self.expenses)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df["days"] = (df["timestamp"] - df["timestamp"].min()).dt.days
+        self.model.fit(df[["days"]], df["amount"])
+
+    def predict_next_expense(self):
+        if len(self.expenses) < 3:
+            return "Not enough data to predict."
+        df = pd.DataFrame(self.expenses)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        last_day = (df["timestamp"].max() - df["timestamp"].min()).days + 1
+        prediction = self.model.predict([[last_day]])
+        return f"Estimated next expense: ₹{prediction[0]:.2f}"
+
+    def get_summary(self):
+        if not self.expenses:
+            return "No expenses recorded."
+        df = pd.DataFrame(self.expenses)
+        summary = df.groupby("category")["amount"].sum()
+        total = df["amount"].sum()
+        return "\n".join([f"{cat.capitalize()}: ₹{amt:.2f}" for cat, amt in summary.items()] + [f"Total: ₹{total:.2f}"])
+
+    def get_calendar_warnings(self):
+        creds = get_google_credentials()
+        if not creds:
+            return "User not authenticated. Please login first."
+
+        service = build('calendar', 'v3', credentials=creds)
+        now = datetime.utcnow().isoformat() + 'Z'
+        later = (datetime.utcnow() + timedelta(days=30)).isoformat() + 'Z'
+        events_result = service.events().list(
+            calendarId='primary', timeMin=now, timeMax=later,
+            singleEvents=True, orderBy='startTime').execute()
+        events = events_result.get('items', [])
+        keywords = ["birthday", "festival", "party", "trip", "event"]
+        warnings = []
+        for event in events:
+            summary = event.get("summary", "").lower()
+            if any(k in summary for k in keywords):
+                date = event['start'].get('dateTime', event['start'].get('date'))
+                warnings.append(f"Event on {date[:10]}: {summary.title()} - Plan your budget!")
+        return "\n".join(warnings) if warnings else "No upcoming major events detected."
+
+    def get_economic_trends(self):
+        try:
+            ticker = "^NSEI"
+            data = yf.download(ticker, period="6mo", interval="1wk", progress=False)
+            if data.empty:
+                return "Market data unavailable."
+            close_prices = data["Close"].dropna()
+            if len(close_prices) < 2:
+                return "Not enough closing price data."
+            start, end = close_prices.iloc[0], close_prices.iloc[-1]
+            pct_change = ((end - start) / start) * 100
+            return f"NIFTY 6-month trend: {pct_change:.2f}%"
+        except Exception as e:
+            return f"Error fetching data: {e}"
+
+# 📲 Flask interaction with ExpenseBot
+bot = ExpenseBot("user123")
+
+@app.route('/')
+def dashboard():
+    return "Welcome to ExpenseBot Web! Use /login to connect your Google Calendar."
+
+@app.route('/add', methods=['POST'])
+def add_expense():
+    data = request.json
+    amount = float(data.get("amount"))
+    category = data.get("category")
+    bot.add_expense(amount, category)
+    return jsonify({"message": f"Added ₹{amount} for {category}"})
+
+@app.route('/summary')
+def summary():
+    return bot.get_summary()
+
+@app.route('/predict')
+def predict():
+    bot.train_predictor()
+    return bot.predict_next_expense()
+
+@app.route('/calendar')
+def calendar():
+    return bot.get_calendar_warnings()
+
+@app.route('/trend')
+def trend():
+    return bot.get_economic_trends()
+
+# ✅ Run the app
+if __name__ == '__main__':
+    app.run(debug=True)
