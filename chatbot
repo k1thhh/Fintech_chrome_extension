@@ -1,0 +1,314 @@
+# CHATBOT BACKEND 
+
+import datetime
+import re
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression
+
+class ExpenseBot:
+    def __init__(self):
+        self.data = pd.DataFrame(columns=["date", "amount", "category"])
+        self.limits = {}
+        self.last_expense = None
+        self.expense_count = 0
+        self.model = LinearRegression()
+        self.last_intent = None
+
+    def add_expense(self, amount, category):
+        now = datetime.datetime.now()
+        self.last_expense = {"date": now, "amount": amount, "category": category}
+        new_row = pd.DataFrame([self.last_expense])
+        self.data = pd.concat([self.data, new_row], ignore_index=True)
+        self.expense_count += 1
+
+        response = f"Added ₹{amount:.2f} to {category}."
+
+        if self.expense_count > 10:
+            suggestions = self.get_suggestions()
+            return response + "\n\nHere are your insights:\n" + suggestions
+        else:
+            return response
+
+    def get_total(self, category=None):
+        if category:
+            total = self.data[self.data["category"] == category]["amount"].sum()
+            return f"Total spent in {category}: ₹{total:.2f}"
+        else:
+            total = self.data["amount"].sum()
+            return f"Total spent: ₹{total:.2f}"
+
+    def get_summary(self):
+        if self.data.empty:
+            return "No expenses to summarize."
+        summary = self.data.groupby("category")["amount"].sum()
+        summary_text = "Spending summary:\n" + "\n".join(f"{cat}: ₹{amt:.2f}" for cat, amt in summary.items())
+        return summary_text
+
+    def get_history(self, category=None, limit=5):
+        if self.data.empty:
+            return "No expenses recorded yet."
+        filtered = self.data if category is None else self.data[self.data["category"] == category]
+        if filtered.empty:
+            return f"No expenses in category '{category}'."
+        recent = filtered.sort_values(by="date", ascending=False).head(limit)
+        return recent.to_string(index=False)
+
+    def train_predictor(self):
+        if self.data.empty:
+            return
+        df = self.data.copy()
+        df["day"] = pd.to_datetime(df["date"]).dt.dayofyear
+        X = df[["day"]]
+        y = df["amount"]
+        self.model.fit(X, y)
+
+    def predict_next_expense(self):
+        if self.data.empty:
+            return "Not enough data to predict."
+        next_day = datetime.datetime.now().timetuple().tm_yday + 1
+        prediction = self.model.predict([[next_day]])[0]
+        return f"Estimated next expense: ₹{prediction:.2f}"
+
+    def get_suggestions(self):
+        if self.data.empty:
+            return "Add some expenses to get insights."
+        avg_spending = self.data.groupby("category")["amount"].mean()
+        suggestions = []
+        for cat, avg in avg_spending.items():
+            limit = self.limits.get(cat)
+            if limit and avg > limit:
+                suggestions.append(f"⚠️ You're spending more than your limit in '{cat}' (avg ₹{avg:.2f} > limit ₹{limit:.2f})")
+            else:
+                suggestions.append(f"Average spending in '{cat}' is ₹{avg:.2f}")
+        return "\n".join(suggestions)
+
+    def set_limit(self, category, amount):
+        self.limits[category] = amount
+        return f"Limit set for {category}: ₹{amount:.2f}"
+
+    def check_limits(self):
+        alerts = []
+        for cat, limit in self.limits.items():
+            avg = self.data[self.data["category"] == cat]["amount"].mean()
+            if avg > limit:
+                alerts.append(f"⚠️ Average spending in {cat} is over limit: ₹{avg:.2f} / ₹{limit:.2f}")
+        return "\n".join(alerts) if alerts else "All spending averages are within limits."
+
+    def clear_all(self):
+        self.data = pd.DataFrame(columns=["date", "amount", "category"])
+        self.expense_count = 0
+        return "All expense data cleared."
+
+    def clear_category(self, category):
+        original_len = len(self.data)
+        self.data = self.data[self.data["category"] != category]
+        deleted_count = original_len - len(self.data)
+        self.expense_count = len(self.data)
+        return f"Cleared {deleted_count} entries from {category}."
+
+    def get_spending_streak(self):
+        if self.data.empty:
+            return "No data to compute streaks."
+        df = self.data.copy()
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        unique_days = sorted(set(df["date"]))
+        streak = 1
+        max_streak = 1
+        for i in range(1, len(unique_days)):
+            if (unique_days[i] - unique_days[i - 1]).days == 1:
+                streak += 1
+                max_streak = max(max_streak, streak)
+            else:
+                streak = 1
+        return f"Your longest daily spending streak is {max_streak} days."
+
+    def undo_last_expense(self):
+        if self.last_expense is None:
+            return "No last expense to undo."
+        mask = (self.data["date"] == self.last_expense["date"]) & \
+               (self.data["amount"] == self.last_expense["amount"]) & \
+               (self.data["category"] == self.last_expense["category"])
+        self.data = self.data[~mask]
+        self.expense_count = len(self.data)
+        undone = self.last_expense
+        self.last_expense = None
+        return f"Removed last expense: ₹{undone['amount']:.2f} in {undone['category']}."
+
+    def plot_pie_chart(self):
+        if self.data.empty:
+            return "No data to plot."
+        summary = self.data.groupby("category")["amount"].sum()
+        plt.figure(figsize=(6, 6))
+        plt.pie(summary, labels=summary.index, autopct='%1.1f%%', startangle=140)
+        plt.title("Expense Distribution by Category")
+        plt.axis('equal')
+        plt.tight_layout()
+        plt.show()
+        return "Pie chart displayed."
+
+    def load_csv(self, filename):
+        try:
+            df = pd.read_csv(filename)
+            required_cols = {"amount", "category"}
+            if not required_cols.issubset(df.columns):
+                return "CSV file must have 'amount' and 'category' columns."
+            
+            now = datetime.datetime.now()
+            df["date"] = now
+            df = df[["date", "amount", "category"]]
+            
+            self.data = pd.concat([self.data, df], ignore_index=True)
+            self.expense_count = len(self.data)
+            return f"Successfully loaded {len(df)} expenses from '{filename}'."
+        except FileNotFoundError:
+            return f"File '{filename}' not found."
+        except Exception as e:
+            return f"Error loading CSV: {e}"
+
+    def extract_intent(self, user_input):
+        user_input = user_input.lower()
+
+        if re.search(r"\b(hi|hello|hey|yo|hii|heyy)\b", user_input):
+            return "greeting"
+        if "how are you" in user_input:
+            return "how_are_you"
+        if "thank" in user_input:
+            return "thanks"
+        if "bye" in user_input or "goodbye" in user_input:
+            return "bye"
+
+        if "add" in user_input:
+            return "add_expense"
+        elif "total" in user_input:
+            return "get_total"
+        elif "summary" in user_input:
+            return "get_summary"
+        elif "history" in user_input:
+            return "get_history"
+        elif "predict" in user_input:
+            return "predict_next_expense"
+        elif "suggest" in user_input or "insight" in user_input:
+            return "get_suggestions"
+        elif "set limit" in user_input or ("limit" in user_input and re.search(r'\d', user_input)):
+            return "set_limit"
+        elif "check limit" in user_input or "limits" in user_input:
+            return "check_limits"
+        elif "clear all" in user_input:
+            return "clear_all"
+        elif "clear" in user_input:
+            return "clear_category"
+        elif "streak" in user_input:
+            return "get_spending_streak"
+        elif "undo" in user_input:
+            return "undo_last_expense"
+        elif "upload" in user_input and "csv" in user_input:
+            return "upload_csv"
+        elif "pie" in user_input and "chart" in user_input:
+            return "show_pie_chart"
+
+        return "unknown"
+
+    def interact(self, user_input):
+        user_input = user_input.strip()
+        intent = self.extract_intent(user_input)
+        self.last_intent = intent
+
+        if intent == "greeting":
+            return "Hi there! 😊 How can I help you with your expenses today?"
+        elif intent == "how_are_you":
+            return "I'm doing great, thanks for asking! How can I assist you today?"
+        elif intent == "thanks":
+            return "You're welcome! Let me know if you need anything else."
+        elif intent == "bye":
+            return "Goodbye! Stay smart with your spending. 👋"
+
+        if intent == "add_expense":
+            expenses = []
+            parts = re.split(r',| and ', user_input.lower())
+            for part in parts:
+                match = re.search(r'(?:add )?\$?(\d+(?:\.\d+)?)\s+(?:to\s+)?([a-z]+)', part.strip())
+                if match:
+                    amt, cat = match.groups()
+                    expenses.append((float(amt), cat))
+            if not expenses:
+                return "Please specify the amount and category like 'add 100 to food'."
+            responses = []
+            for amt, cat in expenses:
+                responses.append(self.add_expense(amt, cat))
+            return "\n".join(responses)
+
+        if intent == "get_total":
+            m = re.search(r"total(?: in| for)? ([a-z]+)", user_input)
+            cat = m.group(1) if m else None
+            return self.get_total(cat)
+
+        if intent == "get_summary":
+            return self.get_summary()
+
+        if intent == "get_history":
+            m = re.search(r"history(?: of)? ([a-z]+)", user_input)
+            cat = m.group(1) if m else None
+            return self.get_history(cat)
+
+        if intent == "predict_next_expense":
+            self.train_predictor()
+            return self.predict_next_expense()
+
+        if intent == "get_suggestions":
+            return self.get_suggestions()
+
+        if intent == "set_limit":
+            m = re.search(r"limit(?: for)? ([a-z]+) ?(?:is|=|to)? ?(\d+)", user_input)
+            if m:
+                cat, amt = m.group(1), float(m.group(2))
+                return self.set_limit(cat, amt)
+            else:
+                return "Please specify the category and limit, e.g., 'set limit for food 1000'."
+
+        if intent == "check_limits":
+            return self.check_limits()
+
+        if intent == "clear_all":
+            return self.clear_all()
+
+        if intent == "clear_category":
+            m = re.search(r"clear (?:category )?([a-z]+)", user_input)
+            if m:
+                cat = m.group(1)
+                return self.clear_category(cat)
+            else:
+                return "Please specify the category to clear, e.g., 'clear food'."
+
+        if intent == "get_spending_streak":
+            return self.get_spending_streak()
+
+        if intent == "undo_last_expense":
+            return self.undo_last_expense()
+
+        if intent == "upload_csv":
+            m = re.search(r"upload csv (.+\.csv)", user_input)
+            if m:
+                filename = m.group(1).strip()
+                return self.load_csv(filename)
+            else:
+                return "Please provide the CSV filename, e.g., 'upload csv expenses.csv'."
+
+        if intent == "show_pie_chart":
+            return self.plot_pie_chart()
+
+        return "Sorry, I didn't understand that. Can you please rephrase?"
+
+if __name__ == "__main__":
+    bot = ExpenseBot()
+
+    print("Welcome to ExpenseBot! Type 'bye' to exit.")
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() in ["bye", "exit", "quit"]:
+            print("ExpenseBot:", bot.interact(user_input))
+            break
+        response = bot.interact(user_input)
+        print("ExpenseBot:", response)
+
+
