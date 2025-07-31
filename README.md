@@ -20,6 +20,7 @@ FinSight is an intelligent browser extension designed to revolutionize personal 
 * **Frontend:** React, HTML/CSS
 * **AI/ML:** Optical Character Recognition (OCR), Natural Language Processing (NLP), TensorFlow, PyTorch
 * **Deployment:** Browser Extension framework
+* **OCR DATASET:** https://www.kaggle.com/datasets/trainingdatapro/ocr-receipts-text-detection
 
 ## Impact & Results
 
