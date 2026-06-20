@@ -1,0 +1,336 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(__file__))
+
+from core.registry import ToolRegistry
+from core.agent import Agent
+from tools.expenses import ExpenseStore, register_all as register_expenses
+from tools.google_calendar import register_all as register_calendar
+from tools.gpay import register_all as register_gpay
+from tools.bill_ocr import register_all as register_ocr
+
+
+def build_agent() -> Agent:
+    registry = ToolRegistry()
+
+    print("\nLoading tools...")
+    store = ExpenseStore()
+    register_expenses(registry, store)
+    register_calendar(registry)
+    register_gpay(registry)
+    register_ocr(registry, store)
+    print()
+
+    return Agent(registry)
+
+
+def main():
+    agent = build_agent()
+    print("ExpenseBot ready. Type 'quit' to exit.\n")
+
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBot: Bye.")
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() in ("quit", "exit", "bye"):
+            print("Bot: Bye.")
+            break
+        if user_input.lower() == "/reset":
+            agent.reset()
+            print("Bot: Conversation cleared.\n")
+            continue
+
+        reply = agent.chat(user_input)
+        print(f"Bot: {reply}\n")
+
+
+if __name__ == "__main__":
+    main()
+
+//ocr
+import base64
+import datetime
+import json
+import os
+import anthropic
+from core.base_tool import BaseTool
+from tools.expenses import ExpenseStore
+
+client = anthropic.Anthropic()
+
+BILL_PARSE_PROMPT = """You are a bill parser. Extract expense information from this image of a physical bill/receipt.
+
+Return ONLY valid JSON with this exact structure:
+{
+  "merchant": "<store or vendor name>",
+  "date": "<date on bill, YYYY-MM-DD format, or null if not visible>",
+  "total_amount": <final total as a float, in INR — look for 'Total', 'Grand Total', 'Amount Due', 'Net Payable'>,
+  "currency": "<INR or detected currency>",
+  "category": "<infer one of: food, transport, utilities, shopping, medical, fuel, entertainment, rent, other>",
+  "line_items": [
+    {"description": "<item>", "amount": <float>}
+  ],
+  "confidence": "<high|medium|low — how confident you are in the total amount>"
+}
+
+Rules:
+- total_amount must be the FINAL payable amount, not subtotal
+- If GST/tax is included in the total, don't add it again
+- If the bill is in a regional language, still extract numbers
+- If you cannot determine the total, set total_amount to null
+- line_items can be empty array if not clearly readable
+"""
+
+
+def _image_to_base64(image_path: str) -> tuple[str, str]:
+    """Returns (base64_data, media_type)."""
+    ext = os.path.splitext(image_path)[1].lower()
+    media_type_map = {
+        ".jpg":  "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png":  "image/png",
+        ".webp": "image/webp",
+        ".gif":  "image/gif",
+    }
+    media_type = media_type_map.get(ext, "image/jpeg")
+    with open(image_path, "rb") as f:
+        return base64.standard_b64encode(f.read()).decode("utf-8"), media_type
+
+
+def _extract_from_pdf_first_page(pdf_path: str) -> tuple[str, str]:
+    """Rasterise first page of PDF to PNG, return as base64."""
+    try:
+        import fitz  # pymupdf
+        doc = fitz.open(pdf_path)
+        page = doc[0]
+        pix = page.get_pixmap(dpi=200)
+        img_bytes = pix.tobytes("png")
+        return base64.standard_b64encode(img_bytes).decode("utf-8"), "image/png"
+    except ImportError:
+        raise ImportError("Install pymupdf for PDF support: pip install pymupdf")
+
+
+def parse_bill_image(image_path: str) -> dict:
+    """
+    Core OCR function. Takes a file path, returns parsed bill dict.
+    Can be called standalone without the tool registry.
+    """
+    if not os.path.exists(image_path):
+        return {"error": f"File not found: {image_path}"}
+
+    ext = os.path.splitext(image_path)[1].lower()
+
+    if ext == ".pdf":
+        b64, media_type = _extract_from_pdf_first_page(image_path)
+    else:
+        b64, media_type = _image_to_base64(image_path)
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": b64
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": BILL_PARSE_PROMPT
+                    }
+                ]
+            }
+        ]
+    )
+
+    raw = response.content[0].text.strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"error": "Could not parse vision response as JSON.", "raw": raw}
+
+    parsed["source_file"] = os.path.basename(image_path)
+    parsed["parsed_at"] = datetime.datetime.now().isoformat()
+    return parsed
+
+
+class ScanBill(BaseTool):
+    name = "scan_bill"
+    description = (
+        "Scan a photo of a physical bill or receipt to extract the expense amount, "
+        "merchant, category, and line items. Use when the user wants to upload or "
+        "photograph a bill and log it as an expense."
+    )
+    parameters = {
+        "properties": {
+            "image_path": {
+                "type": "string",
+                "description": "Path to the bill image (JPG, PNG, WEBP) or PDF"
+            },
+            "auto_log": {
+                "type": "boolean",
+                "description": "If true, automatically log the detected expense. Default false."
+            }
+        },
+        "required": ["image_path"]
+    }
+
+    def __init__(self, store: ExpenseStore):
+        self.store = store
+
+    def run(self, image_path: str, auto_log: bool = False):
+        result = parse_bill_image(image_path)
+
+        if "error" in result:
+            return result
+
+        amount   = result.get("total_amount")
+        category = result.get("category", "other")
+        merchant = result.get("merchant", "unknown")
+
+        if amount is None:
+            return {
+                "status": "needs_review",
+                "message": "Could not confidently detect total amount. Please enter it manually.",
+                "parsed": result
+            }
+
+        logged = None
+        if auto_log and amount:
+            self.store.add(amount, category)
+            logged = {"amount": amount, "category": category}
+
+        return {
+            "status": "ok",
+            "merchant":   merchant,
+            "amount":     amount,
+            "category":   category,
+            "date":       result.get("date"),
+            "confidence": result.get("confidence"),
+            "line_items": result.get("line_items", []),
+            "auto_logged": logged,
+            "note": None if auto_log else "Call add_expense to log this, or set auto_log=true next time."
+        }
+
+
+class ScanBillFromBase64(BaseTool):
+    """
+    Alternative: accepts raw base64 string directly.
+    Useful when integrating with a frontend that sends image data over the wire.
+    """
+    name = "scan_bill_base64"
+    description = (
+        "Scan a bill image provided as base64 string. "
+        "Use this when the image comes from a frontend upload rather than a file path."
+    )
+    parameters = {
+        "properties": {
+            "image_base64": {
+                "type": "string",
+                "description": "Base64-encoded image data"
+            },
+            "media_type": {
+                "type": "string",
+                "description": "MIME type: image/jpeg, image/png, or image/webp"
+            },
+            "auto_log": {
+                "type": "boolean",
+                "description": "Automatically log the detected expense."
+            }
+        },
+        "required": ["image_base64", "media_type"]
+    }
+
+    def __init__(self, store: ExpenseStore):
+        self.store = store
+
+    def run(self, image_base64: str, media_type: str = "image/jpeg", auto_log: bool = False):
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": image_base64
+                            }
+                        },
+                        {"type": "text", "text": BILL_PARSE_PROMPT}
+                    ]
+                }
+            ]
+        )
+
+        raw = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            return {"error": "Vision parse failed.", "raw": raw}
+
+        amount   = result.get("total_amount")
+        category = result.get("category", "other")
+
+        logged = None
+        if auto_log and amount:
+            self.store.add(amount, category)
+            logged = {"amount": amount, "category": category}
+
+        return {
+            "status":     "ok",
+            "merchant":   result.get("merchant"),
+            "amount":     amount,
+            "category":   category,
+            "date":       result.get("date"),
+            "confidence": result.get("confidence"),
+            "line_items": result.get("line_items", []),
+            "auto_logged": logged
+        }
+
+
+def register_all(registry, store: ExpenseStore):
+    registry.register(ScanBill(store))
+    registry.register(ScanBillFromBase64(store))
+
+
+# ── Standalone CLI usage ───────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python tools/bill_ocr.py <path_to_bill_image>")
+        sys.exit(1)
+
+    path = sys.argv[1]
+    print(f"Scanning: {path}\n")
+    result = parse_bill_image(path)
+
+    if "error" in result:
+        print(f"Error: {result['error']}")
+    else:
+        print(f"Merchant  : {result.get('merchant')}")
+        print(f"Date      : {result.get('date')}")
+        print(f"Total     : ₹{result.get('total_amount')}")
+        print(f"Category  : {result.get('category')}")
+        print(f"Confidence: {result.get('confidence')}")
+        items = result.get("line_items", [])
+        if items:
+            print("\nLine items:")
+            for item in items:
+                print(f"  {item['description']:<30} ₹{item['amount']}")
