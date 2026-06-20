@@ -1,314 +1,555 @@
-# CHATBOT BACKEND 
+//main
+import sys
+import os
+sys.path.insert(0, os.path.dirname(__file__))
 
-import datetime
-import re
-import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.linear_model import LinearRegression
+from core.registry import ToolRegistry
+from core.agent import Agent
+from tools.expenses import ExpenseStore, register_all as register_expenses
+from tools.google_calendar import register_all as register_calendar
 
-class ExpenseBot:
-    def __init__(self):
-        self.data = pd.DataFrame(columns=["date", "amount", "category"])
-        self.limits = {}
-        self.last_expense = None
-        self.expense_count = 0
-        self.model = LinearRegression()
-        self.last_intent = None
 
-    def add_expense(self, amount, category):
-        now = datetime.datetime.now()
-        self.last_expense = {"date": now, "amount": amount, "category": category}
-        new_row = pd.DataFrame([self.last_expense])
-        self.data = pd.concat([self.data, new_row], ignore_index=True)
-        self.expense_count += 1
+def build_agent() -> Agent:
+    registry = ToolRegistry()
 
-        response = f"Added ₹{amount:.2f} to {category}."
+    print("\nLoading tools...")
+    store = ExpenseStore()
+    register_expenses(registry, store)
+    register_calendar(registry)
+    register_gpay(registry)
+    print()
 
-        if self.expense_count > 10:
-            suggestions = self.get_suggestions()
-            return response + "\n\nHere are your insights:\n" + suggestions
-        else:
-            return response
+    return Agent(registry)
 
-    def get_total(self, category=None):
-        if category:
-            total = self.data[self.data["category"] == category]["amount"].sum()
-            return f"Total spent in {category}: ₹{total:.2f}"
-        else:
-            total = self.data["amount"].sum()
-            return f"Total spent: ₹{total:.2f}"
 
-    def get_summary(self):
-        if self.data.empty:
-            return "No expenses to summarize."
-        summary = self.data.groupby("category")["amount"].sum()
-        summary_text = "Spending summary:\n" + "\n".join(f"{cat}: ₹{amt:.2f}" for cat, amt in summary.items())
-        return summary_text
+def main():
+    agent = build_agent()
+    print("ExpenseBot ready. Type 'quit' to exit.\n")
 
-    def get_history(self, category=None, limit=5):
-        if self.data.empty:
-            return "No expenses recorded yet."
-        filtered = self.data if category is None else self.data[self.data["category"] == category]
-        if filtered.empty:
-            return f"No expenses in category '{category}'."
-        recent = filtered.sort_values(by="date", ascending=False).head(limit)
-        return recent.to_string(index=False)
-
-    def train_predictor(self):
-        if self.data.empty:
-            return
-        df = self.data.copy()
-        df["day"] = pd.to_datetime(df["date"]).dt.dayofyear
-        X = df[["day"]]
-        y = df["amount"]
-        self.model.fit(X, y)
-
-    def predict_next_expense(self):
-        if self.data.empty:
-            return "Not enough data to predict."
-        next_day = datetime.datetime.now().timetuple().tm_yday + 1
-        prediction = self.model.predict([[next_day]])[0]
-        return f"Estimated next expense: ₹{prediction:.2f}"
-
-    def get_suggestions(self):
-        if self.data.empty:
-            return "Add some expenses to get insights."
-        avg_spending = self.data.groupby("category")["amount"].mean()
-        suggestions = []
-        for cat, avg in avg_spending.items():
-            limit = self.limits.get(cat)
-            if limit and avg > limit:
-                suggestions.append(f"⚠️ You're spending more than your limit in '{cat}' (avg ₹{avg:.2f} > limit ₹{limit:.2f})")
-            else:
-                suggestions.append(f"Average spending in '{cat}' is ₹{avg:.2f}")
-        return "\n".join(suggestions)
-
-    def set_limit(self, category, amount):
-        self.limits[category] = amount
-        return f"Limit set for {category}: ₹{amount:.2f}"
-
-    def check_limits(self):
-        alerts = []
-        for cat, limit in self.limits.items():
-            avg = self.data[self.data["category"] == cat]["amount"].mean()
-            if avg > limit:
-                alerts.append(f"⚠️ Average spending in {cat} is over limit: ₹{avg:.2f} / ₹{limit:.2f}")
-        return "\n".join(alerts) if alerts else "All spending averages are within limits."
-
-    def clear_all(self):
-        self.data = pd.DataFrame(columns=["date", "amount", "category"])
-        self.expense_count = 0
-        return "All expense data cleared."
-
-    def clear_category(self, category):
-        original_len = len(self.data)
-        self.data = self.data[self.data["category"] != category]
-        deleted_count = original_len - len(self.data)
-        self.expense_count = len(self.data)
-        return f"Cleared {deleted_count} entries from {category}."
-
-    def get_spending_streak(self):
-        if self.data.empty:
-            return "No data to compute streaks."
-        df = self.data.copy()
-        df["date"] = pd.to_datetime(df["date"]).dt.date
-        unique_days = sorted(set(df["date"]))
-        streak = 1
-        max_streak = 1
-        for i in range(1, len(unique_days)):
-            if (unique_days[i] - unique_days[i - 1]).days == 1:
-                streak += 1
-                max_streak = max(max_streak, streak)
-            else:
-                streak = 1
-        return f"Your longest daily spending streak is {max_streak} days."
-
-    def undo_last_expense(self):
-        if self.last_expense is None:
-            return "No last expense to undo."
-        mask = (self.data["date"] == self.last_expense["date"]) & \
-               (self.data["amount"] == self.last_expense["amount"]) & \
-               (self.data["category"] == self.last_expense["category"])
-        self.data = self.data[~mask]
-        self.expense_count = len(self.data)
-        undone = self.last_expense
-        self.last_expense = None
-        return f"Removed last expense: ₹{undone['amount']:.2f} in {undone['category']}."
-
-    def plot_pie_chart(self):
-        if self.data.empty:
-            return "No data to plot."
-        summary = self.data.groupby("category")["amount"].sum()
-        plt.figure(figsize=(6, 6))
-        plt.pie(summary, labels=summary.index, autopct='%1.1f%%', startangle=140)
-        plt.title("Expense Distribution by Category")
-        plt.axis('equal')
-        plt.tight_layout()
-        plt.show()
-        return "Pie chart displayed."
-
-    def load_csv(self, filename):
+    while True:
         try:
-            df = pd.read_csv(filename)
-            required_cols = {"amount", "category"}
-            if not required_cols.issubset(df.columns):
-                return "CSV file must have 'amount' and 'category' columns."
-            
-            now = datetime.datetime.now()
-            df["date"] = now
-            df = df[["date", "amount", "category"]]
-            
-            self.data = pd.concat([self.data, df], ignore_index=True)
-            self.expense_count = len(self.data)
-            return f"Successfully loaded {len(df)} expenses from '{filename}'."
-        except FileNotFoundError:
-            return f"File '{filename}' not found."
-        except Exception as e:
-            return f"Error loading CSV: {e}"
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBot: Bye.")
+            break
 
-    def extract_intent(self, user_input):
-        user_input = user_input.lower()
+        if not user_input:
+            continue
+        if user_input.lower() in ("quit", "exit", "bye"):
+            print("Bot: Bye.")
+            break
+        if user_input.lower() == "/reset":
+            agent.reset()
+            print("Bot: Conversation cleared.\n")
+            continue
 
-        if re.search(r"\b(hi|hello|hey|yo|hii|heyy)\b", user_input):
-            return "greeting"
-        if "how are you" in user_input:
-            return "how_are_you"
-        if "thank" in user_input:
-            return "thanks"
-        if "bye" in user_input or "goodbye" in user_input:
-            return "bye"
+        reply = agent.chat(user_input)
+        print(f"Bot: {reply}\n")
 
-        if "add" in user_input:
-            return "add_expense"
-        elif "total" in user_input:
-            return "get_total"
-        elif "summary" in user_input:
-            return "get_summary"
-        elif "history" in user_input:
-            return "get_history"
-        elif "predict" in user_input:
-            return "predict_next_expense"
-        elif "suggest" in user_input or "insight" in user_input:
-            return "get_suggestions"
-        elif "set limit" in user_input or ("limit" in user_input and re.search(r'\d', user_input)):
-            return "set_limit"
-        elif "check limit" in user_input or "limits" in user_input:
-            return "check_limits"
-        elif "clear all" in user_input:
-            return "clear_all"
-        elif "clear" in user_input:
-            return "clear_category"
-        elif "streak" in user_input:
-            return "get_spending_streak"
-        elif "undo" in user_input:
-            return "undo_last_expense"
-        elif "upload" in user_input and "csv" in user_input:
-            return "upload_csv"
-        elif "pie" in user_input and "chart" in user_input:
-            return "show_pie_chart"
-
-        return "unknown"
-
-    def interact(self, user_input):
-        user_input = user_input.strip()
-        intent = self.extract_intent(user_input)
-        self.last_intent = intent
-
-        if intent == "greeting":
-            return "Hi there! 😊 How can I help you with your expenses today?"
-        elif intent == "how_are_you":
-            return "I'm doing great, thanks for asking! How can I assist you today?"
-        elif intent == "thanks":
-            return "You're welcome! Let me know if you need anything else."
-        elif intent == "bye":
-            return "Goodbye! Stay smart with your spending. 👋"
-
-        if intent == "add_expense":
-            expenses = []
-            parts = re.split(r',| and ', user_input.lower())
-            for part in parts:
-                match = re.search(r'(?:add )?\$?(\d+(?:\.\d+)?)\s+(?:to\s+)?([a-z]+)', part.strip())
-                if match:
-                    amt, cat = match.groups()
-                    expenses.append((float(amt), cat))
-            if not expenses:
-                return "Please specify the amount and category like 'add 100 to food'."
-            responses = []
-            for amt, cat in expenses:
-                responses.append(self.add_expense(amt, cat))
-            return "\n".join(responses)
-
-        if intent == "get_total":
-            m = re.search(r"total(?: in| for)? ([a-z]+)", user_input)
-            cat = m.group(1) if m else None
-            return self.get_total(cat)
-
-        if intent == "get_summary":
-            return self.get_summary()
-
-        if intent == "get_history":
-            m = re.search(r"history(?: of)? ([a-z]+)", user_input)
-            cat = m.group(1) if m else None
-            return self.get_history(cat)
-
-        if intent == "predict_next_expense":
-            self.train_predictor()
-            return self.predict_next_expense()
-
-        if intent == "get_suggestions":
-            return self.get_suggestions()
-
-        if intent == "set_limit":
-            m = re.search(r"limit(?: for)? ([a-z]+) ?(?:is|=|to)? ?(\d+)", user_input)
-            if m:
-                cat, amt = m.group(1), float(m.group(2))
-                return self.set_limit(cat, amt)
-            else:
-                return "Please specify the category and limit, e.g., 'set limit for food 1000'."
-
-        if intent == "check_limits":
-            return self.check_limits()
-
-        if intent == "clear_all":
-            return self.clear_all()
-
-        if intent == "clear_category":
-            m = re.search(r"clear (?:category )?([a-z]+)", user_input)
-            if m:
-                cat = m.group(1)
-                return self.clear_category(cat)
-            else:
-                return "Please specify the category to clear, e.g., 'clear food'."
-
-        if intent == "get_spending_streak":
-            return self.get_spending_streak()
-
-        if intent == "undo_last_expense":
-            return self.undo_last_expense()
-
-        if intent == "upload_csv":
-            m = re.search(r"upload csv (.+\.csv)", user_input)
-            if m:
-                filename = m.group(1).strip()
-                return self.load_csv(filename)
-            else:
-                return "Please provide the CSV filename, e.g., 'upload csv expenses.csv'."
-
-        if intent == "show_pie_chart":
-            return self.plot_pie_chart()
-
-        return "Sorry, I didn't understand that. Can you please rephrase?"
 
 if __name__ == "__main__":
-    bot = ExpenseBot()
+    main()
+//agent 
+import anthropic
+from core.registry import ToolRegistry
 
-    print("Welcome to ExpenseBot! Type 'bye' to exit.")
-    while True:
-        user_input = input("You: ")
-        if user_input.lower() in ["bye", "exit", "quit"]:
-            print("ExpenseBot:", bot.interact(user_input))
-            break
-        response = bot.interact(user_input)
-        print("ExpenseBot:", response)
+SYSTEM = """You are a personal finance assistant. You are sharp, concise, and practical.
+
+You help the user track expenses, manage their Google Calendar for finance-related events
+(bill due dates, salary day, budget reviews), and will support payments in future.
+
+Personality:
+- Direct. No filler phrases like "Great question!" or "Certainly!"
+- Use rupee symbol for all amounts.
+- If you log an expense, confirm it in one line. Don't over-explain.
+- If the user's message is ambiguous, ask one clarifying question — not three.
+- Never expose internal tool names or JSON to the user.
+
+You have tools. Use them. Chain them when it makes sense.
+If a tool errors, tell the user plainly and suggest a fix.
+"""
+
+
+class Agent:
+    def __init__(self, registry: ToolRegistry, model: str = "claude-sonnet-4-6"):
+        self.registry = registry
+        self.model = model
+        self.client = anthropic.Anthropic()
+        self.history: list[dict] = []
+
+    def chat(self, user_message: str) -> str:
+        self.history.append({"role": "user", "content": user_message})
+
+        while True:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                system=SYSTEM,
+                tools=self.registry.to_claude_specs(),
+                messages=self.history
+            )
+
+            tool_uses  = [b for b in response.content if b.type == "tool_use"]
+            text_blocks = [b for b in response.content if b.type == "text"]
+
+            # No tool calls → final reply, exit loop
+            if not tool_uses:
+                self.history.append({"role": "assistant", "content": response.content})
+                return " ".join(b.text for b in text_blocks).strip()
+
+            # Append assistant turn (with tool_use blocks)
+            self.history.append({"role": "assistant", "content": response.content})
+
+            # Execute every tool Claude called, collect results
+            results = []
+            for tu in tool_uses:
+                result_json = self.registry.dispatch_json(tu.name, tu.input)
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu.id,
+                    "content": result_json
+                })
+
+            self.history.append({"role": "user", "content": results})
+            # Loop continues → Claude sees results and decides next step
+
+    def reset(self):
+        self.history.clear()
+//registry 
+import json
+from typing import Any
+from core.base_tool import BaseTool
+
+
+class ToolRegistry:
+    """
+    Single source of truth for all tools.
+    Add a new integration = instantiate it and call registry.register().
+    The agent loop never needs to change.
+    """
+
+    def __init__(self):
+        self._tools: dict[str, BaseTool] = {}
+
+    def register(self, tool: BaseTool):
+        self._tools[tool.name] = tool
+        print(f"  ✓ registered tool: {tool.name}")
+
+    def to_claude_specs(self) -> list[dict]:
+        return [t.to_claude_spec() for t in self._tools.values()]
+
+    def dispatch(self, tool_name: str, tool_input: dict) -> Any:
+        tool = self._tools.get(tool_name)
+        if not tool:
+            return {"error": f"No tool named '{tool_name}' is registered."}
+        try:
+            result = tool.run(**tool_input)
+            return result
+        except TypeError as e:
+            return {"error": f"Bad arguments for '{tool_name}': {e}"}
+        except Exception as e:
+            return {"error": f"Tool '{tool_name}' failed: {e}"}
+
+    def dispatch_json(self, tool_name: str, tool_input: dict) -> str:
+        return json.dumps(self.dispatch(tool_name, tool_input), default=str)
+
+    //base_tool
+    from abc import ABC, abstractmethod
+from typing import Any
+
+class BaseTool(ABC):
+    """
+    Every integration (expenses, calendar, gpay, etc.) is a BaseTool.
+    Register it once. The agent discovers and calls it automatically.
+    """
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Unique snake_case name used by the LLM to call this tool."""
+        ...
+
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        """Plain-English description — this is what the LLM reads to decide when to call it."""
+        ...
+
+    @property
+    @abstractmethod
+    def parameters(self) -> dict:
+        """JSON Schema for the tool's input parameters."""
+        ...
+
+    @abstractmethod
+    def run(self, **kwargs) -> Any:
+        """Execute the tool. Return a JSON-serialisable value."""
+        ...
+
+    def to_claude_spec(self) -> dict:
+        """Converts this tool into the format Claude's API expects."""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": {
+                "type": "object",
+                **self.parameters
+            }
+        }
+//expense_tracker 
+"""
+Expense tracking tools.
+Each operation is its own class — clean, testable, swappable.
+All share a single ExpenseStore instance injected at startup.
+"""
+
+import datetime
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+from core.base_tool import BaseTool
+
+
+class ExpenseStore:
+    """Shared in-memory store. Swap this for SQLite/Postgres anytime."""
+    def __init__(self):
+        self.df = pd.DataFrame(columns=["date", "amount", "category"])
+        self.limits: dict[str, float] = {}
+        self.last: dict | None = None
+        self._lr = LinearRegression()
+
+    def add(self, amount: float, category: str):
+        row = {"date": datetime.datetime.now(), "amount": amount, "category": category.lower()}
+        self.df = pd.concat([self.df, pd.DataFrame([row])], ignore_index=True)
+        self.last = row
+        return row
+
+    def total(self, category: str | None = None) -> float:
+        df = self.df if not category else self.df[self.df["category"] == category.lower()]
+        return round(df["amount"].sum(), 2)
+
+    def summary(self) -> dict:
+        if self.df.empty:
+            return {}
+        return self.df.groupby("category")["amount"].sum().round(2).to_dict()
+
+    def history(self, category: str | None = None, limit: int = 5) -> list:
+        if self.df.empty:
+            return []
+        df = self.df if not category else self.df[self.df["category"] == category.lower()]
+        return df.sort_values("date", ascending=False).head(limit)[
+            ["date", "amount", "category"]
+        ].astype(str).to_dict(orient="records")
+
+    def predict(self) -> float | None:
+        if len(self.df) < 3:
+            return None
+        df = self.df.copy()
+        df["day"] = pd.to_datetime(df["date"]).dt.dayofyear
+        self._lr.fit(df[["day"]], df["amount"])
+        next_day = datetime.datetime.now().timetuple().tm_yday + 1
+        return round(self._lr.predict([[next_day]])[0], 2)
+
+    def undo(self) -> dict | None:
+        if not self.last:
+            return None
+        mask = (
+            (self.df["date"] == self.last["date"]) &
+            (self.df["amount"] == self.last["amount"]) &
+            (self.df["category"] == self.last["category"])
+        )
+        self.df = self.df[~mask]
+        undone, self.last = self.last, None
+        return undone
+
+    def clear(self, category: str | None = None) -> int:
+        before = len(self.df)
+        if category:
+            self.df = self.df[self.df["category"] != category.lower()]
+        else:
+            self.df = pd.DataFrame(columns=["date", "amount", "category"])
+            self.last = None
+        return before - len(self.df)
+
+
+# ── Individual tools ───────────────────────────────────────────────────────────
+
+class AddExpense(BaseTool):
+    name = "add_expense"
+    description = "Log a new expense. Call this whenever the user mentions spending money."
+    parameters = {
+        "properties": {
+            "amount":   {"type": "number",  "description": "Amount spent in INR"},
+            "category": {"type": "string",  "description": "Category, e.g. food, transport, rent"}
+        },
+        "required": ["amount", "category"]
+    }
+    def __init__(self, store: ExpenseStore): self.store = store
+    def run(self, amount: float, category: str):
+        row = self.store.add(amount, category)
+        return {"logged": {"amount": amount, "category": category, "at": str(row["date"])}}
+
+
+class GetTotal(BaseTool):
+    name = "get_total"
+    description = "Get total spending. Optionally filter by category."
+    parameters = {
+        "properties": {
+            "category": {"type": "string", "description": "Category to filter by (optional)"}
+        }
+    }
+    def __init__(self, store: ExpenseStore): self.store = store
+    def run(self, category: str | None = None):
+        return {"total": self.store.total(category), "category": category or "all"}
+
+
+class GetSummary(BaseTool):
+    name = "get_summary"
+    description = "Get a breakdown of spending by category."
+    parameters = {"properties": {}}
+    def __init__(self, store: ExpenseStore): self.store = store
+    def run(self):
+        return {"summary": self.store.summary()}
+
+
+class GetHistory(BaseTool):
+    name = "get_history"
+    description = "Get recent expense history, optionally filtered by category."
+    parameters = {
+        "properties": {
+            "category": {"type": "string"},
+            "limit":    {"type": "integer", "description": "Max entries to return (default 5)"}
+        }
+    }
+    def __init__(self, store: ExpenseStore): self.store = store
+    def run(self, category: str | None = None, limit: int = 5):
+        return {"history": self.store.history(category, limit)}
+
+
+class SetLimit(BaseTool):
+    name = "set_limit"
+    description = "Set a monthly spending limit for a category."
+    parameters = {
+        "properties": {
+            "category": {"type": "string"},
+            "amount":   {"type": "number"}
+        },
+        "required": ["category", "amount"]
+    }
+    def __init__(self, store: ExpenseStore): self.store = store
+    def run(self, category: str, amount: float):
+        self.store.limits[category.lower()] = amount
+        return {"set": {"category": category, "limit": amount}}
+
+
+class CheckLimits(BaseTool):
+    name = "check_limits"
+    description = "Check if any categories have exceeded their set limits."
+    parameters = {"properties": {}}
+    def __init__(self, store: ExpenseStore): self.store = store
+    def run(self):
+        if not self.store.limits:
+            return {"message": "No limits set."}
+        return {"alerts": [
+            {"category": cat, "total": self.store.total(cat), "limit": lim,
+             "over": self.store.total(cat) > lim}
+            for cat, lim in self.store.limits.items()
+        ]}
+
+
+class PredictExpense(BaseTool):
+    name = "predict_next_expense"
+    description = "Predict the next likely expense amount based on history."
+    parameters = {"properties": {}}
+    def __init__(self, store: ExpenseStore): self.store = store
+    def run(self):
+        pred = self.store.predict()
+        if pred is None:
+            return {"error": "Need at least 3 expenses to predict."}
+        return {"predicted_amount": pred}
+
+
+class UndoExpense(BaseTool):
+    name = "undo_last_expense"
+    description = "Remove the most recently added expense."
+    parameters = {"properties": {}}
+    def __init__(self, store: ExpenseStore): self.store = store
+    def run(self):
+        undone = self.store.undo()
+        if not undone:
+            return {"error": "Nothing to undo."}
+        return {"undone": {"amount": undone["amount"], "category": undone["category"]}}
+
+
+class ClearExpenses(BaseTool):
+    name = "clear_expenses"
+    description = "Delete expense data. Optionally clear only one category."
+    parameters = {
+        "properties": {
+            "category": {"type": "string", "description": "Category to clear. Omit to clear everything."}
+        }
+    }
+    def __init__(self, store: ExpenseStore): self.store = store
+    def run(self, category: str | None = None):
+        n = self.store.clear(category)
+        return {"deleted": n, "scope": category or "all"}
+
+
+def register_all(registry, store: ExpenseStore):
+    for ToolClass in [AddExpense, GetTotal, GetSummary, GetHistory,
+                      SetLimit, CheckLimits, PredictExpense, UndoExpense, ClearExpenses]:
+        registry.register(ToolClass(store))
+//calendar
+import datetime
+import os
+from core.base_tool import BaseTool
+
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
+TOKEN_FILE  = "token.json"
+CREDS_FILE  = "credentials.json"
+
+
+def _get_service():
+    """Handles OAuth2 flow and returns an authenticated Calendar service."""
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+
+    creds = None
+    if os.path.exists(TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not os.path.exists(CREDS_FILE):
+                raise FileNotFoundError(
+                    f"'{CREDS_FILE}' not found. Download it from Google Cloud Console."
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(TOKEN_FILE, "w") as f:
+            f.write(creds.to_json())
+    return build("calendar", "v3", credentials=creds)
+
+
+class ListCalendarEvents(BaseTool):
+    name = "list_calendar_events"
+    description = (
+        "List upcoming Google Calendar events. Use for checking scheduled bills, "
+        "salary dates, reminders, or any finance-related events."
+    )
+    parameters = {
+        "properties": {
+            "max_results": {
+                "type": "integer",
+                "description": "Max number of events to return (default 10)"
+            },
+            "query": {
+                "type": "string",
+                "description": "Optional text to search within events"
+            }
+        }
+    }
+
+    def run(self, max_results: int = 10, query: str | None = None):
+        try:
+            service = _get_service()
+            now = datetime.datetime.utcnow().isoformat() + "Z"
+            kwargs = {
+                "calendarId": "primary",
+                "timeMin": now,
+                "maxResults": max_results,
+                "singleEvents": True,
+                "orderBy": "startTime"
+            }
+            if query:
+                kwargs["q"] = query
+            events = service.events().list(**kwargs).execute().get("items", [])
+            return {
+                "events": [
+                    {
+                        "id": e["id"],
+                        "title": e.get("summary", "(no title)"),
+                        "start": e["start"].get("dateTime", e["start"].get("date")),
+                        "end":   e["end"].get("dateTime",   e["end"].get("date")),
+                        "description": e.get("description", "")
+                    }
+                    for e in events
+                ]
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+
+class CreateCalendarEvent(BaseTool):
+    name = "create_calendar_event"
+    description = (
+        "Create a Google Calendar event. Use when the user wants to set a reminder "
+        "for a bill due date, budget review, salary day, or any finance event."
+    )
+    parameters = {
+        "properties": {
+            "title":       {"type": "string", "description": "Event title"},
+            "start":       {"type": "string", "description": "Start datetime ISO 8601, e.g. 2025-07-01T10:00:00"},
+            "end":         {"type": "string", "description": "End datetime ISO 8601"},
+            "description": {"type": "string", "description": "Optional event description"},
+            "reminder_minutes": {
+                "type": "integer",
+                "description": "Minutes before event to send a reminder (default 30)"
+            }
+        },
+        "required": ["title", "start", "end"]
+    }
+
+    def run(self, title: str, start: str, end: str,
+            description: str = "", reminder_minutes: int = 30):
+        try:
+            service = _get_service()
+            event = {
+                "summary": title,
+                "description": description,
+                "start": {"dateTime": start, "timeZone": "Asia/Kolkata"},
+                "end":   {"dateTime": end,   "timeZone": "Asia/Kolkata"},
+                "reminders": {
+                    "useDefault": False,
+                    "overrides": [{"method": "popup", "minutes": reminder_minutes}]
+                }
+            }
+            created = service.events().insert(calendarId="primary", body=event).execute()
+            return {
+                "created": {
+                    "id":    created["id"],
+                    "title": created.get("summary"),
+                    "start": created["start"].get("dateTime"),
+                    "link":  created.get("htmlLink")
+                }
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+
+class DeleteCalendarEvent(BaseTool):
+    name = "delete_calendar_event"
+    description = "Delete a Google Calendar event by its ID."
+    parameters = {
+        "properties": {
+            "event_id": {"type": "string", "description": "The event ID (from list_calendar_events)"}
+        },
+        "required": ["event_id"]
+    }
+
+    def run(self, event_id: str):
+        try:
+            service = _get_service()
+            service.events().delete(calendarId="primary", eventId=event_id).execute()
+            return {"deleted": event_id}
+        except Exception as e:
+            return {"error": str(e)}
+
+
+def register_all(registry):
+    for ToolClass in [ListCalendarEvents, CreateCalendarEvent, DeleteCalendarEvent]:
+        registry.register(ToolClass())
 
 
